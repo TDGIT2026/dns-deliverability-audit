@@ -16,7 +16,7 @@ No install, no API key, no account. It reads public DNS and nothing else.
 | Check | What it actually verifies |
 |---|---|
 | **SPF** | Record validity, syntax, and the **10 lookup limit counted through nested includes**, which is where most SPF records silently fail |
-| **DKIM** | Scans 40+ known selectors, reports key size, and flags **stale keys left behind by decommissioned tools** |
+| **DKIM** | Scans 45+ known selectors, reports key size, and flags **stale keys left behind by decommissioned tools** |
 | **DMARC** | Presence, policy, alignment mode, `rua` destination, and organisational domain fallback |
 | **MX** | Resolves the mailbox host and identifies the provider |
 | **MTA-STS / TLS** | Policy presence, reported as optional |
@@ -29,13 +29,31 @@ can be well over the limit once each include's own includes are resolved. Past t
 `permerror`, and receivers are free to treat that as a fail. Most online checkers count only the top level
 and report a passing record that is not passing.
 
+### One resolver is not enough to count them
+
+Counting recursively is not sufficient on its own, because **a resolver can serve an incomplete TXT record
+set**. Measured 2026-08-03: for `zoho.com`, `1.1.1.1` returned 19 TXT records with the `v=spf1` one missing,
+over UDP and TCP alike, while `8.8.8.8` and `9.9.9.9` both returned 23 including it. Node's built in
+`resolveTxt` uses the OS resolver, so on a machine pointed at Cloudflare the include target looks like it
+has no SPF and the walk stops early. **A domain whose true count is 5 reports 1.**
+
+So include resolution queries the OS resolver plus `8.8.8.8`, `1.1.1.1` and `9.9.9.9` independently and takes
+the first answer that actually contains an SPF record. **The cost is real: a full audit takes roughly 30 to
+40 seconds rather than a few.** That is the right trade for a number you are going to put in front of a
+client, but it matters if you run this in a loop over a list.
+
 ## Why stale DKIM keys matter
 
 DKIM selectors **cannot be enumerated from DNS**. There is no way to list them, you can only guess names and
 query each one. So a key published for a tool you stopped using three years ago stays live and invisible.
 Anyone who still holds that private key can sign mail as your domain and pass DKIM.
 
-This tool brute forces a list of 40+ known provider selectors specifically to surface those.
+This tool brute forces a list of 45+ known provider selectors specifically to surface those.
+
+⚠️ **A selector list is never complete, and a missing name reads exactly like missing DKIM.** Cloudflare
+Email Routing signs on `cf2024-1`, which was absent from this list until 2026-08-03, so the tool reported
+"no DKIM found" on a domain that had a valid 2048 bit key. If a provider is known to sign and the scan says
+otherwise, pass `--selector=` before believing the scan.
 
 If you know a custom selector name, pass it:
 

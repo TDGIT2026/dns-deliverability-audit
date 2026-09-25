@@ -46,6 +46,9 @@ const DKIM_SELECTORS = [...new Set([
   ...extraSelectors,
   'google', 'default', 'selector1', 'selector2', 's1', 's2',
   'zmail', 'zoho', 'zohomail',
+  // Cloudflare Email Routing signs forwarded mail on a dated selector. Absent
+  // from this list the tool reported "no DKIM" on a domain that plainly had it.
+  'cf2024-1', 'cf2023-1', 'cf2022-1',
   'k1', 'k2', 'k3', 'mail', 'dkim', 'email', 'smtp',
   'resend', 'sendgrid', 'mandrill', 'mailjet', 'sparkpost',
   'pm', 'pic', 'protonmail', 'protonmail2', 'protonmail3',
@@ -121,6 +124,39 @@ const parentOf = (d) => {
   return p.length > 2 ? p.slice(1).join('.') : null;
 };
 
+// A single resolver can serve an INCOMPLETE TXT RRset, and that silently breaks
+// the lookup count. Measured 2026-08-03: for zoho.com, 1.1.1.1 returned 19 TXT
+// records with the v=spf1 one absent, over UDP and TCP alike, while 8.8.8.8 and
+// 9.9.9.9 both returned 23 including it. The consequence is not cosmetic: an
+// include: whose SPF is invisible contributes 1 instead of its whole subtree, so
+// mail.missflorenski.com reported 1/10 when the true recursive count is 5.
+//
+// So SPF resolution never trusts one resolver. Query several independently and
+// take the first that actually yields an SPF record. Nothing here is inferred
+// from a single answer, which is the same rule the audits themselves run on.
+const SPF_RESOLVERS = ['8.8.8.8', '1.1.1.1', '9.9.9.9'];
+
+async function txtFromAnyResolver(name) {
+  const attempts = [async () => txt(name, 2)];
+  for (const server of SPF_RESOLVERS) {
+    attempts.push(async () => {
+      // dns.promises.Resolver, NOT dns.Resolver. The latter is callback-only and
+      // returns undefined, so the whole probe silently resolves to nothing.
+      const r = new dns.Resolver({ timeout: 3000, tries: 2 });
+      r.setServers([server]);
+      const recs = await r.resolveTxt(name).catch(() => null);
+      return recs ? recs.map((x) => x.join('')) : [];
+    });
+  }
+  let best = [];
+  for (const attempt of attempts) {
+    const recs = await attempt().catch(() => []);
+    if (recs.some((t) => /^v=spf1/i.test(t))) return recs; // authoritative enough
+    if (recs.length > best.length) best = recs;
+  }
+  return best;
+}
+
 // Count DNS lookups an SPF record forces. Hard-capped at 10 by RFC 7208;
 // exceeding it makes SPF PERMERROR, which silently kills authentication.
 async function countSpfLookups(record, depth = 0, seen = new Set()) {
@@ -135,7 +171,7 @@ async function countSpfLookups(record, depth = 0, seen = new Set()) {
       const target = m.split(/[:=]/)[1];
       if (target && !seen.has(target)) {
         seen.add(target);
-        const nested = (await txt(target)).find((t) => /^v=spf1/i.test(t));
+        const nested = (await txtFromAnyResolver(target)).find((t) => /^v=spf1/i.test(t));
         if (nested) n += await countSpfLookups(nested, depth + 1, seen);
       }
     }
